@@ -1,0 +1,198 @@
+* Why programs as values?
+** Background
+   - Config vs Config[F]
+   - [[https://gitter.im/typelevel/cats-effect?at=5ecca8252280c80cbfcad796][Gitter]]
+   - Step out of this config problem. Why there is value in referential transparency?
+   - How can we actually make it clear to people?
+   - On a surface level, most people agree referential transparency is good
+   - But they are willing to go only so far to get it.
+   - Not to blame people, but after pursuing ref transparency to an
+     extent, the benefits are hard to perceive.
+** Aim: Present a case where this becomes visible
+   - Case: Stack safety problem in scala
+     - Other options are mentioned in the chat link but I chose this
+       one as this one doesn't require too much library/domain specific knowledge
+   - If any of this is not interesting, you should feel free to drop
+     off now.
+** Problem: Limitations of Tail Call Elimination
+   - Tail call elimination in scala
+*** Example 1: Compiler can't eliminate tail call
+    #+BEGIN_SRC scala
+    def unsafeFac(n: Int): Int = {
+      if (n == 0) 1
+      else n * unsafeFac(n - 1)
+    }
+    #+END_SRC
+*** Example 2: Mutual recursion
+    #+BEGIN_SRC scala
+    def unsafeEven(n: Int): Boolean = {
+      if (n == 0) true
+      else unsafeOdd(n - 1)
+    }
+
+    def unsafeOdd(n: Int): Boolean = {
+      if (n == 0) false
+      else unsafeEven(n - 1)
+    }
+    #+END_SRC
+*** Solution: Trampoline
+    - Not unique to scala
+    - Idea: Don't create a stack entry. When you detect a call that
+      pushes values into stack, lift it to the heap.
+    - How do you lift it to heap?
+    - What gets stored in heap - values
+    - Turn function call into a value
+    - Values are referentially transparent
+*** Trampoline v1
+    - Recursive calls that create an entry into stack are suspended
+      and pushed into the heap
+    - There is a transfer of control between runT and the original function
+    - runT is the recursive function now and it's tail recursive
+    - Whenever the original function creates an entry into stack, it
+      transfer control to runT
+    - runT access values from the heap and executes them without
+      creating a stack entry
+    #+BEGIN_SRC scala
+sealed trait Trampoline[A] {
+  import Trampoline._
+
+  @tailrec
+  final def runT: A = this match {
+    case Done(a) => a
+    case More(f) => f().runT
+  }
+}
+
+object Trampoline {
+  case class Done[A](result: A) extends Trampoline[A]
+  case class More[A](func: () => Trampoline[A]) extends Trampoline[A]
+}    
+    #+END_SRC
+*** Trampoline v2
+    - This only solves a part of the problem.
+    - Direct recursive calls => suspended calls
+    - If you have to act on the result of the recursive function, what
+      do you do?
+    - Example: Factorial function
+      #+BEGIN_SRC scala
+   def unsafeFac(n: Int): Int = {
+    if (n == 0) 1
+    else n * unsafeFac(n - 1)
+  }
+      #+END_SRC
+    - We need a another value to represent the action that follows
+      after running recursive function
+      #+BEGIN_SRC scala
+sealed trait Trampoline[A] {
+  import Trampoline._
+
+  @tailrec
+  final def runT: A = this match {
+    case Done(a) => a
+    case More(f) => f().runT
+    case RunAndProcess(tb, f) =>
+      tb match {
+        case Done(b) => f(b).runT
+        case More(k) => (RunAndProcess(k(), f): Trampoline[A]).runT
+        case RunAndProcess(b, g) => (RunAndProcess(b, (r: Any) => RunAndProcess(g(r), f)): Trampoline[A]).runT
+      }
+  }
+}
+
+object Trampoline {
+  case class Done[A](result: A) extends Trampoline[A]
+  case class More[A](func: () => Trampoline[A]) extends Trampoline[A]
+  case class RunAndProcess[A, B](value: Trampoline[A], f: A => Trampoline[B]) extends Trampoline[B]
+}
+      #+END_SRC
+*** Example 3: Can the problems be more subtle?
+    - Consider the problem here
+    - When we fold a list, we just add the index to it.
+    - The index is stored in state
+    #+BEGIN_SRC scala
+  // (true, false, false ...) => ((1, true), (2, true)...)
+  def addNumbersToList[A](xs: List[A]): List[(Int, A)] = {
+    xs.foldLeft(State.pure[Int, List[(Int, A)]](List.empty[(Int, A)]))(
+        (acc: State[Int, List[(Int, A)]], a: A) => {
+          for {
+            (xs) <- acc
+            s <- State.getState[Int]
+            _ <- State.putState[Int](s + 1)
+          } yield (s, a) :: xs
+        }
+      ) // output here is state which is a function 
+      .runS(0)
+      ._1
+      .reverse
+  }    
+    #+END_SRC
+    - State((0) => (0, 1))).flatMap(() => execute prev func + result)
+*** Trampoline <-> Monad
+    - Done - *return*
+    - RunAndProcess - *bind/flatMap* - execute the action and apply the
+      result to the next action
+    - More - Suspend the function call and move it into heap -
+      *Haskell Equivalent*
+    - Different steps involved in executing any (recursive) program ->
+      actions(values or case classes)
+    - This structure is Monadic      
+      #+BEGIN_SRC scala
+      def myFunction():A = {
+        val ex = ...
+        myNetworkCall()
+        myPrintFunction()
+        return a * myFunction() // Trampoline handles any form of recursive function
+      }
+      #+END_SRC
+      #+BEGIN_SRC scala
+      def myFunction():Trampoline[A] = {
+        val ex = ...
+        myNetworkCall()
+        myPrintFunction()
+        return Trampoline.RunAndProcess(myFunction(), (a) => a * r) // Trampoline handles any form of recursive function
+      }
+      #+END_SRC
+*** Trampoline looks familiar?
+    - Free Monad
+    - Trampoline is just Free[Function0, A]
+      #+BEGIN_SRC scala
+      sealed abstract class Free[S[_] : Functor, A]
+      final private[free] case class Pure[S[_], A](a: A) extends Free[S, A]
+      final private[free] case class Suspend[S[_], A](a: S[A]) extends Free[S, A]
+      final private[free] case class FlatMapped[S[_], B, C](c: Free[S, C], f: C => Free[S, B]) extends Free[S, B]
+      #+END_SRC
+      #+BEGIN_SRC scala
+      type Trampoline[A] = Free[Function0, A]
+      #+END_SRC
+    - Provide a functor implementation for Function0 and you can use
+      FreeMonad
+      #+BEGIN_SRC scala
+    implicit val f0 = new Functor[Function0] {
+      def map[A, B](fa: Function0[A])(f: A => B): Function0[B] = { () =>
+        f(fa())
+      }
+    }
+      #+END_SRC
+    - Quote from [[http://okmij.org/ftp/Haskell/extensible/more.pdf][Free Monad paper]]
+      #+BEGIN_SRC text
+In English, if we take a monad, say, State s with its return, bind,
+fmap, put and get operations and forget the first two, we can
+recover the monad as Free (State s), with prosthetic return and
+bind. In short, we get the Monad instance for free.      
+      #+END_SRC
+    - [[https://github.com/typelevel/cats/blob/7c07f71e73e691469d07e79044674c325c7daaa7/free/src/main/scala/cats/free/Free.scala#L15][Free as found in cats]]
+*** TrampolinedState to State
+    - We can get rid of map and flatMap since that's already provided
+      by the monad instance
+    - Represent your actions as data structures aka DSL
+    - State has get and put
+    - Compose your actions. None of your actions has evaluated.
+    - Write the interpreter of your DSL
+*** Putting it all together: Connection with cats, cats-effect, fs2
+    - This is the single idea that makes cats, cats-effect and other
+      FP libraries possible
+    - The idea is language agnotic
+    - [[https://github.com/scala/scala/blob/v2.13.3/src/library/scala/util/control/TailCalls.scala#L49][Tail calls]]
+    - [[https://github.com/typelevel/cats/blob/master/core/src/main/scala/cats/data/IndexedStateT.scala][cats-state implementation]] - IndexedStateT to State to Eval
+    - [[https://github.com/typelevel/cats-effect/blob/2bb878fd3ca0255ec6d035280339f2238b8578b1/core/shared/src/main/scala/cats/effect/internals/IORunLoop.scala][cats-effect]]
+    - [[https://github.com/typelevel/fs2/blob/d204632259136c43687a34328f2bfbcade80b3f2/core/shared/src/main/scala/fs2/Chunk.scala#L1707][fs2-loop]]

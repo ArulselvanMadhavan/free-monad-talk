@@ -1,0 +1,12 @@
+* Free Monads
+** Tail Call Elimination
+
+   - TCE is limited to self recursive methods
+   - Trampoline as a general solution for TCE
+   - With trampolines, no need for call stack?
+** Trampoline
+   - Each step yields to a single control loop
+   - Stack for heap
+   - Monad - transforms any call into a tail call that can be eliminated
+** Example 1
+   - 
